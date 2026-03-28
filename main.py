@@ -248,6 +248,27 @@ def list_cmd() -> None:
             click.echo(f"  {name}")
 
 
+MAX_ATTEMPTS = 3
+
+
+def _ask_one(name: str, position: str, stored_hash: str) -> bool:
+    """Prompt for *name* up to MAX_ATTEMPTS times; return True if correct."""
+    click.echo(f"[{position}] Testing: {name}")
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        password = click.prompt("Password", hide_input=True)
+        if not password:
+            raise click.UsageError("Password must not be empty.")
+        if verify_password(password, stored_hash):
+            click.echo("  correct\n")
+            return True
+        remaining = MAX_ATTEMPTS - attempt
+        if remaining > 0:
+            click.echo(f"  WRONG — {remaining} attempt(s) left\n")
+        else:
+            click.echo("  WRONG — no attempts left\n")
+    return False
+
+
 @cli.command("ask")
 def ask_cmd() -> None:
     """Test all stored passwords in random order."""
@@ -258,28 +279,43 @@ def ask_cmd() -> None:
         click.echo("No services stored. Use 'add' to add one.")
         return
 
+    # Round 1
     order = list(services.items())
     random.shuffle(order)
     total = len(order)
     correct = 0
+    failed: list[tuple[str, str]] = []
 
     for i, (name, uuid_key) in enumerate(order, 1):
         stored_hash = retrieve_hash(KEYRING_SERVICE, uuid_key)
         if stored_hash is None:
             click.echo(f"[{i}/{total}] ⚠ {name}  (hash missing from keyring, skipping)")
             continue
-
-        click.echo(f"[{i}/{total}] Testing: {name}")
-        password = click.prompt("Password", hide_input=True)
-        if not password:
-            raise click.UsageError("Password must not be empty.")
-        if verify_password(password, stored_hash):
-            click.echo("  correct\n")
+        if _ask_one(name, f"{i}/{total}", stored_hash):
             correct += 1
         else:
-            click.echo("  WRONG\n")
+            failed.append((name, uuid_key))
 
-    click.echo(f"Result: {correct}/{total} correct")
+    click.echo(f"Round 1 result: {correct}/{total} correct")
+
+    # Round 2: retry failures
+    if failed:
+        random.shuffle(failed)
+        click.echo(f"\nRetrying {len(failed)} failed password(s)…\n")
+        r2_total = len(failed)
+        r2_correct = 0
+        for i, (name, uuid_key) in enumerate(failed, 1):
+            stored_hash = retrieve_hash(KEYRING_SERVICE, uuid_key)
+            if stored_hash is None:
+                click.echo(
+                    f"[{i}/{r2_total}] ⚠ {name}  (hash missing from keyring, skipping)"
+                )
+                continue
+            if _ask_one(name, f"{i}/{r2_total}", stored_hash):
+                r2_correct += 1
+        click.echo(f"Round 2 result: {r2_correct}/{r2_total} correct")
+    else:
+        click.echo("No failures — great job!")
 
 
 def main() -> None:
