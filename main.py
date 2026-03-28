@@ -30,11 +30,10 @@ _CALIBRATION_PASSWORD = "calibration-sentinel-do-not-use"
 def load_config(path: Path = CONFIG_PATH) -> dict[str, object]:
     """Read config from *path*; return a fresh config if the file is absent."""
     if not path.exists():
-        return {"services": {}, "keyring_keys": [], "argon2_params": None}
+        return {"services": {}, "argon2_params": None}
     with path.open() as f:
         data: dict[str, object] = json.load(f)
     data.setdefault("services", {})
-    data.setdefault("keyring_keys", [])
     data.setdefault("argon2_params", None)
     return data
 
@@ -79,7 +78,7 @@ def calibrate_argon2(target_seconds: float = 1.0) -> dict[str, int]:
 
     @param target_seconds: Minimum seconds a single hash should take (default 1s).
     @return: Parameter dict suitable for make_hasher().
-    @raises RuntimeError: If memory_cost would exceed 32 GiB (safety guard).
+    @raises RuntimeError: If memory_cost would exceed 1 GiB (safety guard).
     """
     parallelism = os.cpu_count() or 1
     params: dict[str, int] = {
@@ -174,8 +173,6 @@ def add(name: str) -> None:
     """Add or update the password for service NAME."""
     config = load_config()
     services: dict[str, str] = config["services"]  # type: ignore[assignment]
-    keyring_keys: list[str] = config["keyring_keys"]  # type: ignore[assignment]
-    service = KEYRING_SERVICE
 
     # Calibrate on first use
     if config["argon2_params"] is None:
@@ -195,10 +192,7 @@ def add(name: str) -> None:
         if not click.confirm(f"'{name}' already exists. Overwrite?", default=False):
             click.echo("Aborted.")
             return
-        old_key = services[name]
-        delete_hash(service, old_key)
-        if old_key in keyring_keys:
-            keyring_keys.remove(old_key)
+        delete_hash(KEYRING_SERVICE, services[name])
 
     password = click.prompt("Password", hide_input=True, confirmation_prompt=True)
     if not password:
@@ -207,11 +201,9 @@ def add(name: str) -> None:
     hash_str = hash_password(password, params)
 
     uuid_key = str(uuid.uuid4())
-    store_hash(service, uuid_key, hash_str)
-    keyring_keys.append(uuid_key)
+    store_hash(KEYRING_SERVICE, uuid_key, hash_str)
     services[name] = uuid_key
     config["services"] = services
-    config["keyring_keys"] = keyring_keys
     save_config(config)
     click.echo(f"Stored '{name}'.")
 
@@ -222,8 +214,6 @@ def delete(name: str) -> None:
     """Delete the stored password for service NAME."""
     config = load_config()
     services: dict[str, str] = config["services"]  # type: ignore[assignment]
-    keyring_keys: list[str] = config["keyring_keys"]  # type: ignore[assignment]
-    service = KEYRING_SERVICE
 
     if name not in services:
         raise click.UsageError(
@@ -234,46 +224,28 @@ def delete(name: str) -> None:
         click.echo("Aborted.")
         return
 
-    uuid_key = services.pop(name)
-    delete_hash(service, uuid_key)
-    if uuid_key in keyring_keys:
-        keyring_keys.remove(uuid_key)
+    delete_hash(KEYRING_SERVICE, services.pop(name))
     config["services"] = services
-    config["keyring_keys"] = keyring_keys
     save_config(config)
     click.echo(f"Deleted '{name}'.")
 
 
 @cli.command("list")
 def list_cmd() -> None:
-    """List all stored services, flagging inconsistencies with the keyring."""
+    """List all stored services, flagging entries missing from the keyring."""
     config = load_config()
     services: dict[str, str] = config["services"]  # type: ignore[assignment]
-    keyring_keys: list[str] = config["keyring_keys"]  # type: ignore[assignment]
-    service = KEYRING_SERVICE
 
-    # Check each service entry against the keyring
-    if services:
-        click.echo(f"Stored services ({len(services)}):")
-        for name, uuid_key in sorted(services.items()):
-            if retrieve_hash(service, uuid_key) is None:
-                click.echo(f"  ⚠ {name}  (hash missing from keyring)")
-            else:
-                click.echo(f"  {name}")
-    else:
+    if not services:
         click.echo("No services stored.")
+        return
 
-    # Check for keyring keys tracked in config but no longer in services
-    live_keys = set(services.values())
-    orphaned = [
-        k
-        for k in keyring_keys
-        if k not in live_keys and retrieve_hash(service, k) is not None
-    ]
-    if orphaned:
-        click.echo(f"\nOrphaned keyring entries ({len(orphaned)}):")
-        for key in orphaned:
-            click.echo(f"  ⚠ {key}  (not in config)")
+    click.echo(f"Stored services ({len(services)}):")
+    for name, uuid_key in sorted(services.items()):
+        if retrieve_hash(KEYRING_SERVICE, uuid_key) is None:
+            click.echo(f"  ⚠ {name}  (hash missing from keyring)")
+        else:
+            click.echo(f"  {name}")
 
 
 @cli.command("ask")
@@ -281,7 +253,6 @@ def ask_cmd() -> None:
     """Test all stored passwords in random order."""
     config = load_config()
     services: dict[str, str] = config["services"]  # type: ignore[assignment]
-    service = KEYRING_SERVICE
 
     if not services:
         click.echo("No services stored. Use 'add' to add one.")
@@ -293,7 +264,7 @@ def ask_cmd() -> None:
     correct = 0
 
     for i, (name, uuid_key) in enumerate(order, 1):
-        stored_hash = retrieve_hash(service, uuid_key)
+        stored_hash = retrieve_hash(KEYRING_SERVICE, uuid_key)
         if stored_hash is None:
             click.echo(f"[{i}/{total}] ⚠ {name}  (hash missing from keyring, skipping)")
             continue
