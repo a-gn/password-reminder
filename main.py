@@ -18,7 +18,7 @@ import keyring
 import keyring.errors
 
 CONFIG_PATH = Path.home() / ".password-reminder" / "config.json"
-KEYRING_SERVICE = "password-reminder"
+KEYRING_SERVICE = "password-reminder-4ff2035c33a144428e3ab8b3e5b07aff"
 _CALIBRATION_PASSWORD = "calibration-sentinel-do-not-use"
 
 
@@ -28,12 +28,13 @@ _CALIBRATION_PASSWORD = "calibration-sentinel-do-not-use"
 
 
 def load_config(path: Path = CONFIG_PATH) -> dict[str, object]:
-    """Read config from *path*; return empty config if the file is absent."""
+    """Read config from *path*; return a fresh config if the file is absent."""
     if not path.exists():
-        return {"services": {}, "argon2_params": None}
+        return {"services": {}, "keyring_keys": [], "argon2_params": None}
     with path.open() as f:
         data: dict[str, object] = json.load(f)
     data.setdefault("services", {})
+    data.setdefault("keyring_keys", [])
     data.setdefault("argon2_params", None)
     return data
 
@@ -88,17 +89,20 @@ def calibrate_argon2(target_seconds: float = 1.0) -> dict[str, int]:
         "hash_len": 32,
         "salt_len": 16,
     }
-    max_memory_kib = 32 * 1024 * 1024  # 32 GiB guard
+    max_memory_kib = 1024 * 1024  # 1 GiB guard
     while True:
         elapsed = _time_one_hash(params)
         if elapsed >= target_seconds:
             return params
         if params["memory_cost"] >= max_memory_kib:
             raise RuntimeError(
-                f"Could not reach {target_seconds}s target even at 32 GiB memory. "
-                "Something is very wrong with the environment."
+                f"Could not reach {target_seconds}s target at the maximum of "
+                f"{max_memory_kib // 1024} MiB (last hash took {elapsed:.2f}s)."
             )
-        params = {**params, "memory_cost": params["memory_cost"] * 2}
+        params = {
+            **params,
+            "memory_cost": min(params["memory_cost"] * 2, max_memory_kib),
+        }
 
 
 def make_hasher(params: dict[str, int]) -> argon2.PasswordHasher:
@@ -136,29 +140,20 @@ def verify_password(password: str, stored_hash: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def store_hash(uuid_key: str, hash_str: str) -> None:
+def store_hash(service: str, uuid_key: str, hash_str: str) -> None:
     """Store *hash_str* in the system keyring under *uuid_key*."""
-    keyring.set_password(KEYRING_SERVICE, uuid_key, hash_str)
+    keyring.set_password(service, uuid_key, hash_str)
 
 
-def retrieve_hash(uuid_key: str) -> str:
-    """Retrieve the hash stored under *uuid_key*.
-
-    @raises ValueError: If no entry is found (should not happen in normal flow).
-    """
-    value = keyring.get_password(KEYRING_SERVICE, uuid_key)
-    if value is None:
-        raise ValueError(
-            f"No hash found in keyring for key {uuid_key!r}. "
-            "The keyring entry may have been deleted manually."
-        )
-    return value
+def retrieve_hash(service: str, uuid_key: str) -> str | None:
+    """Retrieve the hash stored under *uuid_key*, or None if absent."""
+    return keyring.get_password(service, uuid_key)
 
 
-def delete_hash(uuid_key: str) -> None:
+def delete_hash(service: str, uuid_key: str) -> None:
     """Delete the keyring entry for *uuid_key*, ignoring missing-key errors."""
     try:
-        keyring.delete_password(KEYRING_SERVICE, uuid_key)
+        keyring.delete_password(service, uuid_key)
     except keyring.errors.PasswordDeleteError:
         pass
 
@@ -179,6 +174,8 @@ def add(name: str) -> None:
     """Add or update the password for service NAME."""
     config = load_config()
     services: dict[str, str] = config["services"]  # type: ignore[assignment]
+    keyring_keys: list[str] = config["keyring_keys"]  # type: ignore[assignment]
+    service = KEYRING_SERVICE
 
     # Calibrate on first use
     if config["argon2_params"] is None:
@@ -198,18 +195,85 @@ def add(name: str) -> None:
         if not click.confirm(f"'{name}' already exists. Overwrite?", default=False):
             click.echo("Aborted.")
             return
-        delete_hash(services[name])
+        old_key = services[name]
+        delete_hash(service, old_key)
+        if old_key in keyring_keys:
+            keyring_keys.remove(old_key)
 
     password = click.prompt("Password", hide_input=True, confirmation_prompt=True)
+    if not password:
+        raise click.UsageError("Password must not be empty.")
     click.echo("Hashing… (this takes about a second)")
     hash_str = hash_password(password, params)
 
     uuid_key = str(uuid.uuid4())
-    store_hash(uuid_key, hash_str)
+    store_hash(service, uuid_key, hash_str)
+    keyring_keys.append(uuid_key)
     services[name] = uuid_key
     config["services"] = services
+    config["keyring_keys"] = keyring_keys
     save_config(config)
     click.echo(f"Stored '{name}'.")
+
+
+@cli.command()
+@click.argument("name")
+def delete(name: str) -> None:
+    """Delete the stored password for service NAME."""
+    config = load_config()
+    services: dict[str, str] = config["services"]  # type: ignore[assignment]
+    keyring_keys: list[str] = config["keyring_keys"]  # type: ignore[assignment]
+    service = KEYRING_SERVICE
+
+    if name not in services:
+        raise click.UsageError(
+            f"No service named '{name}'. Use 'list' to see stored services."
+        )
+
+    if not click.confirm(f"Delete '{name}'?", default=False):
+        click.echo("Aborted.")
+        return
+
+    uuid_key = services.pop(name)
+    delete_hash(service, uuid_key)
+    if uuid_key in keyring_keys:
+        keyring_keys.remove(uuid_key)
+    config["services"] = services
+    config["keyring_keys"] = keyring_keys
+    save_config(config)
+    click.echo(f"Deleted '{name}'.")
+
+
+@cli.command("list")
+def list_cmd() -> None:
+    """List all stored services, flagging inconsistencies with the keyring."""
+    config = load_config()
+    services: dict[str, str] = config["services"]  # type: ignore[assignment]
+    keyring_keys: list[str] = config["keyring_keys"]  # type: ignore[assignment]
+    service = KEYRING_SERVICE
+
+    # Check each service entry against the keyring
+    if services:
+        click.echo(f"Stored services ({len(services)}):")
+        for name, uuid_key in sorted(services.items()):
+            if retrieve_hash(service, uuid_key) is None:
+                click.echo(f"  ⚠ {name}  (hash missing from keyring)")
+            else:
+                click.echo(f"  {name}")
+    else:
+        click.echo("No services stored.")
+
+    # Check for keyring keys tracked in config but no longer in services
+    live_keys = set(services.values())
+    orphaned = [
+        k
+        for k in keyring_keys
+        if k not in live_keys and retrieve_hash(service, k) is not None
+    ]
+    if orphaned:
+        click.echo(f"\nOrphaned keyring entries ({len(orphaned)}):")
+        for key in orphaned:
+            click.echo(f"  ⚠ {key}  (not in config)")
 
 
 @cli.command("ask")
@@ -217,6 +281,7 @@ def ask_cmd() -> None:
     """Test all stored passwords in random order."""
     config = load_config()
     services: dict[str, str] = config["services"]  # type: ignore[assignment]
+    service = KEYRING_SERVICE
 
     if not services:
         click.echo("No services stored. Use 'add' to add one.")
@@ -228,9 +293,15 @@ def ask_cmd() -> None:
     correct = 0
 
     for i, (name, uuid_key) in enumerate(order, 1):
+        stored_hash = retrieve_hash(service, uuid_key)
+        if stored_hash is None:
+            click.echo(f"[{i}/{total}] ⚠ {name}  (hash missing from keyring, skipping)")
+            continue
+
         click.echo(f"[{i}/{total}] Testing: {name}")
         password = click.prompt("Password", hide_input=True)
-        stored_hash = retrieve_hash(uuid_key)
+        if not password:
+            raise click.UsageError("Password must not be empty.")
         if verify_password(password, stored_hash):
             click.echo("  correct\n")
             correct += 1
